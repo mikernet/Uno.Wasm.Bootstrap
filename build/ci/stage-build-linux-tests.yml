@@ -23,6 +23,8 @@ jobs:
   - checkout: self
     clean: true
 
+  - template: host-cleanup-linux.yml
+
   - template: dotnet-install.yml
   - template: gitversion.yml
 
@@ -37,6 +39,14 @@ jobs:
       chmod +x test-fingerprint.sh
       ./test-fingerprint.sh
     displayName: Fingerprint Test (dedicated test project)
+
+  ## WebGL 4GB fix test - validates the emscripten GL_UNPACK_ROW_LENGTH backport (#21980)
+  ## is applied to dotnet.native.js when MAXIMUM_MEMORY=4GB, and skipped otherwise
+  - bash: |
+      cd $(build.sourcesdirectory)/src/Uno.Wasm.Tests.WebGL4Gb
+      chmod +x test-webgl-4gb.sh
+      ./test-webgl-4gb.sh
+    displayName: WebGL 4GB Fix Test (dedicated test project)
 
   - bash: |
       cd $(build.sourcesdirectory)/src
@@ -248,4 +258,99 @@ jobs:
     inputs:
       PathtoPublish: $(build.artifactstagingdirectory)
       ArtifactName: uno-wasm-bootstrap-linux-aot
+      ArtifactType: Container
+
+- job: ${{ parameters.jobName }}_02
+  timeoutInMinutes: 90
+
+  container: ${{ parameters.linux_container }}
+
+  workspace:
+    clean: all
+
+  pool:
+    vmImage: ${{ parameters.linux_vmImage }}
+
+  variables:
+    NUGET_PACKAGES: $(build.sourcesdirectory)/.nuget
+    WasmCachePath: $(Agent.TempDirectory)/emsdk-cache
+
+  steps:
+  - checkout: self
+    clean: true
+
+  - template: host-cleanup-linux.yml
+
+  - template: dotnet-install.yml
+  - template: gitversion.yml
+
+  - bash: |
+      cd $(build.sourcesdirectory)/src/Uno.Wasm.Bootstrap
+      dotnet msbuild /r /p:Configuration=Release
+    displayName: Build bootstrap
+
+  ## Memory profiler export format test - builds RayTracer with profiler enabled, then validates export formats
+  - bash: |
+      cd $(build.sourcesdirectory)/src/Uno.Wasm.Sample.RayTracer
+      dotnet clean -c Release
+      dotnet publish -c Release /m:1 /p:WasmShellEnableWasmMemoryProfiler=true /bl:$(build.artifactstagingdirectory)/MemoryProfiler-linux.binlog
+    displayName: Build RayTracer with Memory Profiler
+
+  - bash: |
+      cd $(build.sourcesdirectory)/src/Uno.Wasm.Tests.MemoryProfiler
+      chmod +x test-memory-profiler-export.sh
+      ./test-memory-profiler-export.sh "$(build.artifactstagingdirectory)/memory-profiler-exports"
+    displayName: Memory Profiler Export Format Test
+    env:
+      BUILD_SOURCESDIRECTORY: "$(build.sourcesdirectory)"
+
+  - task: PublishBuildArtifacts@1
+    condition: always()
+    inputs:
+      PathtoPublish: $(build.artifactstagingdirectory)/memory-profiler-exports
+      ArtifactName: memory-profiler-exports
+      ArtifactType: Container
+
+  ## VFS framework assembly load test - builds VfsAssemblyLoad.App with VFS loading + cleanup, then validates at runtime
+  - bash: |
+      cd $(build.sourcesdirectory)/src/Uno.Wasm.Tests.VfsAssemblyLoad
+      chmod +x test-vfs-assembly-load.sh
+      ./test-vfs-assembly-load.sh "$(build.artifactstagingdirectory)/vfs-assembly-load"
+    displayName: VFS Framework Assembly Load Test
+    env:
+      BUILD_SOURCESDIRECTORY: "$(build.sourcesdirectory)"
+
+  - task: PublishBuildArtifacts@1
+    condition: always()
+    inputs:
+      PathtoPublish: $(build.artifactstagingdirectory)/vfs-assembly-load
+      ArtifactName: vfs-assembly-load
+      ArtifactType: Container
+
+  ## WebWorker mode test - builds WebWorker.App and validates worker runtime
+  - task: NodeTool@0
+    inputs:
+      versionSpec: '18.x'
+    displayName: Use Node 18.x (Puppeteer requirement)
+
+  - bash: |
+      cd $(build.sourcesdirectory)/src/Uno.Wasm.Tests.WebWorker
+      chmod +x test-webworker.sh
+      ./test-webworker.sh "$(build.artifactstagingdirectory)/webworker"
+    displayName: WebWorker Mode Test
+    env:
+      BUILD_SOURCESDIRECTORY: "$(build.sourcesdirectory)"
+
+  - task: PublishBuildArtifacts@1
+    condition: always()
+    inputs:
+      PathtoPublish: $(build.artifactstagingdirectory)/webworker
+      ArtifactName: webworker-test
+      ArtifactType: Container
+
+  - task: PublishBuildArtifacts@1
+    condition: always()
+    inputs:
+      PathtoPublish: $(build.artifactstagingdirectory)
+      ArtifactName: uno-wasm-bootstrap-linux-02
       ArtifactType: Container
