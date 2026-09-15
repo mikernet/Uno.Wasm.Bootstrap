@@ -34,6 +34,8 @@ items:
       href: features-pre-compression.md
     - name: Embedded mode
       href: features-embedded.mode.md
+    - name: WebWorker mode
+      href: features-webworker-mode.md
     - name: Native Linker Optimization
       href: features-linker-opts.md
     - name: Memory troubleshooting
@@ -44,12 +46,16 @@ items:
       href: features-simd.md
     - name: Profiling
       href: features-profiling.md
+    - name: Native Memory Profiling
+      href: features-native-memory-profiling.md
     - name: PWA Support
       href: features-pwa.md
     - name: 4GB Support
       href: features-4gb.md
     - name: HttpRequestMessage Extensions
       href: features-httprequestmessage-extensions.md
+    - name: VFS Assembly Loading
+      href: features-vfs-assembly-loading.md
 
 - name: Tools
   items:

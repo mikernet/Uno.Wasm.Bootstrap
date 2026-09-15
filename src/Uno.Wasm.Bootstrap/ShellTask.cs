@@ -121,13 +121,23 @@ namespace Uno.Wasm.Bootstrap
 
 		public string LogProfilerOptions { get; set; } = "log:alloc,output=output.mlpd";
 
+		public string BrowserProfilerSampleInterval { get; set; } = "";
+
 		public string WebAppBasePath { get; set; } = "./";
 
 		public bool GenerateAOTProfile { get; set; }
 
+		public bool EnableMemoryProfiler { get; set; }
+
 		public string FetchRetries { get; set; } = "1";
 
 		public bool EnableThreads { get; set; }
+
+		public bool VfsFrameworkAssemblyLoad { get; set; }
+
+		public bool VfsFrameworkAssemblyLoadCleanup { get; set; }
+
+		public string WorkerFileName { get; set; } = "worker.js";
 
 		public ITaskItem[]? ReferencePath { get; set; }
 
@@ -154,6 +164,7 @@ namespace Uno.Wasm.Bootstrap
 				GeneratePackageFolder();
 				BuildServiceWorker();
 				GenerateEmbeddedJs();
+				GenerateWorkerJs();
 				GenerateIndexHtml();
 				GenerateConfig();
 				RemoveDuplicateAssets();
@@ -297,6 +308,11 @@ namespace Uno.Wasm.Bootstrap
 
 		private void BuildServiceWorker()
 		{
+			if (_shellMode == ShellMode.WebWorker)
+			{
+				return;
+			}
+
 			using var resourceStream = GetType().Assembly.GetManifestResourceStream("Uno.Wasm.Bootstrap.v0.Embedded.service-worker.js");
 			using var reader = new StreamReader(resourceStream);
 
@@ -321,6 +337,18 @@ namespace Uno.Wasm.Bootstrap
 
 			foreach (var (name, source, resource) in q)
 			{
+				// uno-worker-bootstrap.js is the WebWorker entry-point script.
+				// It is consumed via GetManifestResourceStream when generating
+				// shell-worker.js for WebWorker-mode projects, and must never be
+				// added as a regular main-thread dependency: when loaded via a
+				// classic <script> tag it auto-runs WorkerBootstrapper.bootstrap()
+				// on the main thread and tries to fetch uno-config.js from the
+				// page root (404), surfacing a misleading initialization error.
+				if (name == "uno-worker-bootstrap.js")
+				{
+					continue;
+				}
+
 				if (source.Name.Name != Path.GetFileNameWithoutExtension(Assembly))
 				{
 					_dependencies.Add(name);
@@ -571,16 +599,23 @@ namespace Uno.Wasm.Bootstrap
 				config.AppendLine($"config.uno_debugging_enabled = {(!Optimize).ToString().ToLowerInvariant()};");
 				config.AppendLine($"config.uno_enable_tracing = {EnableTracing.ToString().ToLowerInvariant()};");
 				config.AppendLine($"config.uno_load_all_satellite_resources = {LoadAllSatelliteResources.ToString().ToLowerInvariant()};");
-				config.AppendLine($"config.emcc_exported_runtime_methods = [{emccExportedRuntimeMethodsParams}];");
+				config.AppendLine($"config.uno_vfs_framework_assembly_load = {VfsFrameworkAssemblyLoad.ToString().ToLowerInvariant()};");
+				config.AppendLine($"config.uno_vfs_framework_assembly_load_cleanup = {VfsFrameworkAssemblyLoadCleanup.ToString().ToLowerInvariant()};");
+				config.AppendLine($"config.emcc_exported_runtime_methods = [{emccExportedRuntimeMethodsParams}]");
 
 				if (GenerateAOTProfile)
 				{
 					config.AppendLine($"config.generate_aot_profile = true;");
 				}
 
+				if (EnableMemoryProfiler)
+				{
+					config.AppendLine($"config.enable_memory_profiler = true;");
+				}
+
 				config.AppendLine($"config.environmentVariables = config.environmentVariables || {{}};");
 
-				void AddEnvironmentVariable(string name, string value) => config.AppendLine($"config.environmentVariables[\"{name}\"] = \"{value}\";");
+				void AddEnvironmentVariable(string name, string value) => config.AppendLine($"config.environmentVariables[\"{JsStringHelper.EscapeJsString(name)}\"] = \"{JsStringHelper.EscapeJsString(value)}\";");
 
 				if (MonoEnvironment != null)
 				{
@@ -611,6 +646,11 @@ namespace Uno.Wasm.Bootstrap
 				if (EnableLogProfiler)
 				{
 					AddEnvironmentVariable("UNO_BOOTSTRAP_LOG_PROFILER_OPTIONS", LogProfilerOptions);
+				}
+
+				if (!string.IsNullOrEmpty(BrowserProfilerSampleInterval))
+				{
+					AddEnvironmentVariable("UNO_BOOTSTRAP_BROWSER_PROFILER_SAMPLE_INTERVAL", BrowserProfilerSampleInterval);
 				}
 
 				config.AppendLine("export { config };");
@@ -838,6 +878,109 @@ namespace Uno.Wasm.Bootstrap
 			AddStaticAsset("index.html", htmlPath, DeployMode.Root);
 		}
 
+		private void GenerateWorkerJs()
+		{
+			if (_shellMode != ShellMode.WebWorker)
+			{
+				return;
+			}
+
+			var workerFileName = string.IsNullOrWhiteSpace(WorkerFileName) ? "worker.js" : WorkerFileName;
+
+			// Validate the worker filename to prevent injection into generated JS/HTML.
+			if (workerFileName.IndexOfAny(new[] { '"', '\'', '\\', '/', '<', '>', '&', '\n', '\r' }) >= 0
+				|| workerFileName != Path.GetFileName(workerFileName))
+			{
+				throw new InvalidOperationException(
+					$"WasmShellWorkerFileName '{workerFileName}' contains invalid characters. " +
+					"It must be a simple filename without path separators, quotes, or special characters.");
+			}
+
+			var scriptPath = Path.Combine(IntermediateOutputPath, "shell-worker.js");
+
+			using var w = new StreamWriter(scriptPath, append: false, _utf8Encoding);
+
+			// Set the package path before the bootstrapper runs, so it can find uno-config.js.
+			w.WriteLine($"self.__unoWorkerPackagePath = '{PackageAssetsFolder}/';");
+
+			// Read the compiled TypeScript worker bootstrapper from the embedded resource.
+			// The resource name varies by build configuration, so we search for it by suffix.
+			var resourceName = GetType().Assembly.GetManifestResourceNames()
+				.FirstOrDefault(n => n.EndsWith("uno-worker-bootstrap.js"));
+			using var resourceStream = resourceName != null
+				? GetType().Assembly.GetManifestResourceStream(resourceName)
+				: null;
+			if (resourceStream != null)
+			{
+				using var reader = new StreamReader(resourceStream);
+				w.Write(reader.ReadToEnd());
+			}
+			else
+			{
+				throw new InvalidOperationException("Could not find embedded uno-worker-bootstrap.js resource. Ensure the TypeScript worker bootstrapper compiled successfully.");
+			}
+
+			w.Flush();
+
+			// Generate a minimal index.html host page for dev testing
+			var htmlPath = Path.Combine(IntermediateOutputPath, "shell-worker-index.html");
+			using var w2 = new StreamWriter(htmlPath, append: false, _utf8Encoding);
+
+			const string htmlTemplate =
+				"""
+				<!DOCTYPE html>
+				<html>
+				<head><meta charset="utf-8" /><title>WebWorker Host</title></head>
+				<body>
+					<div id="status">Starting worker...</div>
+					<div id="results"></div>
+					<script>
+						const worker = new Worker('./$(WORKER_FILENAME)');
+						const results = document.getElementById('results');
+						const statusEl = document.getElementById('status');
+						const logs = [];
+
+						worker.addEventListener('message', function(e) {
+							logs.push(JSON.stringify(e.data));
+							if (e.data && e.data.type === 'dotnet-ready') {
+								results.textContent = e.data.message;
+								statusEl.textContent = 'Worker ready';
+							} else if (e.data && e.data.type === 'uno-worker-ready') {
+								if (!results.textContent) {
+									statusEl.textContent = 'Runtime initialized';
+								}
+							} else if (e.data && e.data.type === 'uno-profiler-data') {
+								var bytes = Uint8Array.from(atob(e.data.data), function(c) { return c.charCodeAt(0); });
+								var blob = new Blob([bytes]);
+								var a = document.createElement('a');
+								a.href = URL.createObjectURL(blob);
+								a.download = e.data.filename;
+								a.click();
+								URL.revokeObjectURL(a.href);
+								console.log('Downloaded: ' + e.data.filename);
+							} else if (e.data && e.data.type === 'uno-profiler-error') {
+								console.error('Profiler error (' + e.data.command + '): ' + e.data.error);
+							}
+							var logsEl = document.getElementById('logs');
+							if (logsEl) { logsEl.textContent = logs.join('\n'); }
+						});
+
+						worker.addEventListener('error', function(e) {
+							statusEl.textContent = 'Worker error: ' + e.message;
+						});
+					</script>
+					<pre id="logs"></pre>
+				</body>
+				</html>
+				""";
+
+			w2.Write(htmlTemplate.Replace("$(WORKER_FILENAME)", workerFileName));
+			w2.Flush();
+
+			AddStaticAsset(workerFileName, scriptPath, DeployMode.Root);
+			AddStaticAsset("index.html", htmlPath, DeployMode.Root);
+		}
+
 		private string TouchServiceWorker(string workerBody)
 		{
 			workerBody = workerBody.Replace("$(CACHE_KEY)", Guid.NewGuid().ToString());
@@ -858,6 +1001,9 @@ namespace Uno.Wasm.Bootstrap
 
 		private string BuildRuntimeFeatures()
 			=> EnableThreads ? "threads" : "";
+
+		internal static string EscapeJsString(string value)
+			=> JsStringHelper.EscapeJsString(value);
 
 		private void ParseEnumProperty<TEnum>(string name, string stringValue, out TEnum value) where TEnum : struct
 		{

@@ -1,4 +1,5 @@
 ﻿/// <reference path="AotProfilerSupport.ts"/>
+/// <reference path="EmscriptenMemoryProfilerSupport.ts"/>
 /// <reference path="HotReloadSupport.ts"/>
 /// <reference path="UnoConfig.ts"/>
 
@@ -121,10 +122,30 @@ namespace Uno.WebAssembly.Bootstrap {
 				//@ts-ignore
 				var m = await import(`../_framework/${config.config.dotnet_js_filename}`);
 
-				m.dotnet
-					.withModuleConfig({
-						preRun: () => bootstrapper.wasmRuntimePreRun(),
-					})
+				// When the log profiler is enabled, wrap Emscripten's Module.out to
+			// suppress "log-profiler not called (0x...)" printf spam from Mono's
+			// prof_jit_done (log.c). In interpreter mode, the take-heapshot-method
+			// is never JIT-compiled, so every interpreted method triggers this
+			// debug printf — thousands per second, enough to overwhelm test runners.
+			const logProfilerEnabled = config.config.environmentVariables?.["UNO_BOOTSTRAP_LOG_PROFILER_OPTIONS"];
+			const moduleConfig: any = {
+				preRun: [(module: any) => bootstrapper.wasmRuntimePreRun(module)],
+			};
+			if (logProfilerEnabled) {
+				const defaultOut = console.log.bind(console);
+				moduleConfig.out = (message: string) => {
+					if (typeof message === "string" && (
+						message.startsWith("log-profiler not called") ||
+						message.startsWith("log-profiler | taking heapshot") ||
+						message.startsWith("take-heapshot-method:"))) {
+						return;
+					}
+					defaultOut(message);
+				};
+			}
+
+			m.dotnet
+				.withModuleConfig(moduleConfig)
 					.withRuntimeOptions(config.config.uno_runtime_options)
 					.withConfig({ loadAllSatelliteResources: config.config.uno_load_all_satellite_resources });
 
@@ -194,10 +215,72 @@ namespace Uno.WebAssembly.Bootstrap {
 			anyModule.imports.require = (<any>globalThis).require;
 		}
 
-		private wasmRuntimePreRun() {
+		private wasmRuntimePreRun(module?: any) {
+			// Pre-create VFS directories that MONO_PATH references so that the
+			// path validation in mono_set_assemblies_path (assembly.c) succeeds
+			// during mono_init. Without this, a g_warning fires because the
+			// directory does not yet exist when the runtime validates MONO_PATH.
+			if (this._unoConfig.uno_vfs_framework_assembly_load && module?.FS) {
+				try {
+					module.FS.mkdir("/managed");
+				} catch (e) {
+					// Directory may already exist
+				}
+
+				// When enabled, intercept FS.close so that assembly files are
+				// removed from the Emscripten VFS after the Mono runtime reads
+				// them. The runtime's in-memory image cache retains the
+				// MonoImage, so the VFS copy is redundant after the first load
+				// and can be freed to reduce memory pressure.
+				//
+				// We wrap FS.close directly instead of using the
+				// FS.trackingDelegate['onCloseFile'] callback, which is not
+				// reliably invoked in all Emscripten builds.
+				if (this._unoConfig.uno_vfs_framework_assembly_load_cleanup) {
+					this.setupVfsCleanupOnClose(module.FS);
+				}
+			}
+
 			if (LogProfilerSupport.initializeLogProfiler(this._unoConfig)) {
 				this._logProfiler = new LogProfilerSupport(this._context, this._unoConfig);
 			}
+		}
+
+		/**
+		 * Wraps Emscripten's FS.close so that assembly files under /managed
+		 * are unlinked after the runtime closes them. This is more reliable
+		 * than FS.trackingDelegate['onCloseFile'] which is not always called.
+		 */
+		private setupVfsCleanupOnClose(fs: any) {
+			const vfsPrefix = "/managed/";
+			const originalClose = fs.close.bind(fs);
+
+			fs.close = (stream: any) => {
+				const path: string | undefined = stream?.path;
+				const flags: number = stream?.flags ?? -1;
+
+				// Call the original close first so the fd is released.
+				originalClose(stream);
+
+				// Only unlink after read-only close operations.
+				// The VFS resource loader writes files using O_WRONLY|O_CREAT
+				// (FS.writeFile), and we must not delete during that phase.
+				// The Mono runtime reads assemblies with O_RDONLY (0).
+				// O_ACCMODE (lowest 2 bits) == 0 means O_RDONLY.
+				const isReadOnly = flags >= 0 && (flags & 3) === 0;
+
+				if (isReadOnly && path && path.startsWith(vfsPrefix)) {
+					try {
+						fs.unlink(path);
+
+						if (this._monoConfig?.debugLevel && this._monoConfig.debugLevel > 0) {
+							console.log(`[Bootstrap] VFS cleanup: deleted ${path}`);
+						}
+					} catch (_e) {
+						// File may already have been deleted.
+					}
+				}
+			};
 		}
 
 		private RuntimeReady() {
@@ -206,6 +289,7 @@ namespace Uno.WebAssembly.Bootstrap {
 
 			this.initializeRequire();
 			this._aotProfiler = AotProfilerSupport.initialize(this._context, this._unoConfig);
+			EmscriptenMemoryProfilerSupport.initialize(this._unoConfig);
 		}
 
 		private configureGlobal() {
@@ -260,12 +344,249 @@ namespace Uno.WebAssembly.Bootstrap {
 			var logProfilerConfig = this._unoConfig.environmentVariables["UNO_BOOTSTRAP_LOG_PROFILER_OPTIONS"];
 			if (logProfilerConfig) {
 				this._monoConfig.logProfilerOptions = <LogProfilerOptions>{
-					configuration: logProfilerConfig
+					configuration: logProfilerConfig,
+					// takeHeapshot is required by the .NET runtime assert in profiler.ts.
+					// The method name registers a JIT-done callback that triggers
+					// proflog_trigger_heapshot() when the named method is JIT-compiled.
+					// In interpreter mode this never fires (methods aren't JIT'd), and
+					// every other method logs "log-profiler not called" — we suppress
+					// that noise below via the Module.out filter.
+					takeHeapshot: "Uno.LogProfilerSupport:FlushProfile"
 				};
+
+			}
+
+			var browserProfilerInterval = this._unoConfig.environmentVariables["UNO_BOOTSTRAP_BROWSER_PROFILER_SAMPLE_INTERVAL"];
+			if (browserProfilerInterval) {
+				this._monoConfig.browserProfilerOptions = <BrowserProfilerOptions>{
+					sampleIntervalMs: parseInt(browserProfilerInterval)
+				};
+			}
+
+			// When enabled, redirect assemblies to the Emscripten VFS instead of
+			// loading them as in-memory bundled resources. This allows the .NET
+			// runtime's image-level cache (mono_image_open_a_lot) to deduplicate
+			// assembly images loaded from separate AssemblyLoadContexts.
+			if (this._unoConfig.uno_vfs_framework_assembly_load) {
+				this.redirectAssembliesToVfs(config);
+			}
+
+			// Fix satellite resource VFS entries: include culture prefix in name so download URL
+			// resolves to _framework/{culture}/{fingerprinted}.wasm instead of _framework/{fingerprinted}.wasm
+			const res = config.resources as any;
+			if (res?.satelliteResources) {
+				const vfsManagedDir = "/managed";
+
+				const moveArrayToVfs = (source: any[], vfsDir: string, namePrefix: string | undefined) => {
+					if (!source) return;
+					for (const entry of source) {
+						const vfsEntry = { ...entry };
+						if (namePrefix) {
+							vfsEntry.name = namePrefix + "/" + vfsEntry.name;
+						}
+						vfsEntry.virtualPath = vfsDir + "/" + (entry.virtualPath || entry.name);
+						res.vfs = res.vfs || [];
+						res.vfs.push(vfsEntry);
+					}
+				};
+
+				for (const culture in res.satelliteResources) {
+					moveArrayToVfs(res.satelliteResources[culture], vfsManagedDir + "/" + culture, culture);
+				}
 			}
 
 			// Initialize progress tracking with best-guess estimation
 			this.initializeProgressEstimation();
+		}
+
+		/**
+		 * Redirects assembly/pdb/resource assets from in-memory bundled resource
+		 * loading ("assembly" behavior) to Emscripten VFS placement ("vfs" behavior).
+		 *
+		 * When assemblies are loaded as bundled resources, each AssemblyLoadContext
+		 * creates its own MonoImage copy. By placing them in the VFS, the runtime's
+		 * filename-based image cache can deduplicate across ALCs.
+		 *
+		 * This operates on config.resources which uses the .NET 10+ array-based
+		 * format (arrays of {virtualPath, name, integrity, cache} objects).
+		 */
+		private redirectAssembliesToVfs(config: MonoConfig) {
+			const vfsManagedDir = "/managed";
+
+			if (!config.resources) {
+				return;
+			}
+
+			// Cast to any because the .NET 10+ runtime uses an array-based
+			// resource format ({virtualPath, name, integrity, cache}[]) while
+			// the local TypeScript definitions still declare the older
+			// dictionary-based ResourceList / ResourceGroups shapes.
+			const res: any = config.resources;
+
+			if (this._monoConfig.debugLevel && this._monoConfig.debugLevel > 0) {
+				console.log("[Bootstrap] Redirecting assembly loading to VFS-based loading for image cache deduplication");
+			}
+
+			// Set MONO_PATH so the runtime probes this directory for assemblies
+			config.environmentVariables = config.environmentVariables || {};
+			config.environmentVariables["MONO_PATH"] = vfsManagedDir;
+
+			const usesArrayResources =
+				Array.isArray(res.assembly) ||
+				Array.isArray(res.coreAssembly);
+
+			// Only coerce resources.vfs to an array when we are processing the
+			// .NET 10+ array-based resource shape. Preserve legacy dictionary
+			// resource shapes untouched.
+			if (usesArrayResources && !Array.isArray(res.vfs)) {
+				res.vfs = [];
+			}
+
+			const mainAssemblyName = config.mainAssemblyName;
+
+			// Log pre-processing state for diagnostics (debug only)
+			if (this._monoConfig.debugLevel && this._monoConfig.debugLevel > 0) {
+				const asmBefore = Array.isArray(res.assembly) ? res.assembly.length : typeof res.assembly;
+				const coreBefore = Array.isArray(res.coreAssembly) ? res.coreAssembly.length : typeof res.coreAssembly;
+				console.log(
+					`[Bootstrap] VFS redirect: pre-processing state` +
+					` (assembly: ${asmBefore}` +
+					`, coreAssembly: ${coreBefore}` +
+					`, mainAssemblyName: ${mainAssemblyName}` +
+					`, resourceKeys: ${Object.keys(res).join(",")})`);
+			}
+
+			// System.Runtime.InteropServices.JavaScript must stay as a bundled
+			// resource because mono_wasm_bind_assembly_exports (corebindings.c)
+			// requires it loaded before VFS probing is available.
+			const bundledAssemblies = new Set([
+				"System.Runtime.InteropServices.JavaScript",
+				"System.Private.CoreLib",
+			]);
+
+			// Helper: strip file extension from a virtualPath to get the
+			// assembly name for comparison.
+			const assemblyNameOf = (entry: any): string => {
+				const vp: string = entry.virtualPath || entry.name || "";
+				return vp.replace(/\.(wasm|dll)$/, "");
+			};
+
+			// Returns true when an entry must remain as a bundled resource.
+			const mustKeepBundled = (entry: any): boolean => {
+				const name = assemblyNameOf(entry);
+				return name === mainAssemblyName || bundledAssemblies.has(name);
+			};
+
+			// Helper: move array entries to VFS, returning only entries that
+			// should remain as bundled resources. Returns undefined when the
+			// source is not an array (e.g. older dictionary format) so the
+			// caller can leave the original value untouched.
+			const moveArrayToVfs = (
+				source: any,
+				vfsDir: string,
+				keepPredicate?: (entry: any) => boolean,
+				namePrefix?: string
+			): any[] | undefined => {
+				if (!Array.isArray(res.vfs)) {
+					if (this._monoConfig.debugLevel && this._monoConfig.debugLevel > 0) {
+						console.warn(
+							`[Bootstrap] VFS redirect: skipping transformation because resources.vfs is not array-based`);
+					}
+					return undefined;
+				}
+
+				if (!Array.isArray(source)) {
+					if (source && this._monoConfig.debugLevel && this._monoConfig.debugLevel > 0) {
+						console.warn(
+							`[Bootstrap] VFS redirect: skipping non-array resource section` +
+							` (type: ${typeof source})`);
+					}
+					return undefined;
+				}
+
+				const kept: any[] = [];
+				for (const entry of source) {
+					if (keepPredicate && keepPredicate(entry)) {
+						kept.push(entry);
+					} else {
+						const vfsEntry = { ...entry };
+						if (namePrefix) {
+							// For satellite resources: download URL is _framework/{culture}/{fingerprinted}.wasm,
+							// so the name must carry the culture prefix for the runtime's URL resolver.
+							vfsEntry.name = namePrefix + "/" + vfsEntry.name;
+						}
+						const originalVirtualPath = entry.virtualPath || entry.name;
+						// MONO_PATH probing (assembly.c) looks for .dll and .exe
+						// extensions only, but .NET 10+ uses .wasm (WebCIL).
+						// Rename the VFS path so the runtime can find the file.
+						const vfsFileName = originalVirtualPath.replace(/\.wasm$/, ".dll");
+						vfsEntry.virtualPath = vfsDir + "/" + vfsFileName;
+						res.vfs.push(vfsEntry);
+					}
+				}
+				return kept;
+			};
+
+			// Move regular assemblies to VFS (keep main assembly and
+			// runtime-critical assemblies as bundled resources).
+			// Only transform array-format sections; leave dictionary-format
+			// sections (older tooling) unchanged.
+			const newAssembly = moveArrayToVfs(res.assembly, vfsManagedDir, mustKeepBundled);
+			if (newAssembly !== undefined) {
+				res.assembly = newAssembly;
+			}
+
+			// The SDK may place all assemblies in coreAssembly (with an empty
+			// assembly section). Redirect those to VFS as well, keeping only
+			// the main assembly and runtime-critical assemblies that
+			// mono_wasm_bind_assembly_exports needs before VFS probing is
+			// available (System.Runtime.InteropServices.JavaScript,
+			// System.Private.CoreLib).
+			const newCoreAssembly = moveArrayToVfs(res.coreAssembly, vfsManagedDir, mustKeepBundled);
+			if (newCoreAssembly !== undefined) {
+				res.coreAssembly = newCoreAssembly;
+			}
+
+			// Move PDBs to VFS at /managed
+			const newPdb = moveArrayToVfs(res.pdb, vfsManagedDir);
+			if (newPdb !== undefined) {
+				res.pdb = newPdb;
+			}
+
+			// Move core PDBs to VFS at /managed
+			const newCorePdb = moveArrayToVfs(res.corePdb, vfsManagedDir);
+			if (newCorePdb !== undefined) {
+				res.corePdb = newCorePdb;
+			}
+
+			// Move satellite resource assemblies to VFS at /managed/<culture>
+			if (res.satelliteResources) {
+				for (const culture in res.satelliteResources) {
+					if (res.satelliteResources.hasOwnProperty(culture)) {
+						const newSat = moveArrayToVfs(
+							res.satelliteResources[culture],
+							vfsManagedDir + "/" + culture,
+							undefined,
+							culture
+						);
+						if (newSat !== undefined) {
+							res.satelliteResources[culture] = newSat;
+						}
+					}
+				}
+			}
+
+			if (this._monoConfig.debugLevel && this._monoConfig.debugLevel > 0) {
+				const vfsCount = Array.isArray(res.vfs) ? res.vfs.length : 0;
+				const asmIsArray = Array.isArray(res.assembly);
+				const coreIsArray = Array.isArray(res.coreAssembly);
+				console.log(
+					`[Bootstrap] VFS redirect: ${vfsCount} entries moved to ${vfsManagedDir}` +
+					` (assembly: ${asmIsArray ? res.assembly.length : typeof res.assembly}` +
+					`, coreAssembly: ${coreIsArray ? res.coreAssembly.length : typeof res.coreAssembly}` +
+					`, vfs: ${Array.isArray(res.vfs) ? "array" : typeof res.vfs}` +
+					`, mainAssemblyName: ${config.mainAssemblyName})`);
+			}
 		}
 
 		public preInit() {
@@ -282,6 +603,10 @@ namespace Uno.WebAssembly.Bootstrap {
 
 				if (this._hotReloadSupport) {
 					await this._hotReloadSupport.initializeHotReload();
+				}
+
+				if (this._logProfiler) {
+					await this._logProfiler.postInitializeLogProfiler();
 				}
 
 				this._runMain(this._unoConfig.uno_main, []);
